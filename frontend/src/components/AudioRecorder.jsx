@@ -1,23 +1,21 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import AudioVisualizer from './AudioVisualizer'
-import { transcribeAudio } from '../services/api'
+import { TranscriptionStream } from '../services/api'
 
 function AudioRecorder({
-  settings,
-  onTranscriptionStart,
-  onTranscriptionComplete,
-  onTranscriptionError,
-  isProcessing,
+  onSegment,
+  onStatusChange,
+  onError,
 }) {
   const [isRecording, setIsRecording] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [recordingTime, setRecordingTime] = useState(0)
-  const [audioBlob, setAudioBlob] = useState(null)
+  const [streamStatus, setStreamStatus] = useState(null)
 
   const mediaRecorderRef = useRef(null)
-  const chunksRef = useRef([])
   const timerRef = useRef(null)
   const streamRef = useRef(null)
+  const transcriptionStreamRef = useRef(null)
 
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60)
@@ -27,28 +25,43 @@ function AudioRecorder({
 
   const startRecording = async () => {
     try {
+      // Get microphone access
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       streamRef.current = stream
 
+      // Connect to transcription WebSocket
+      const transcriptionStream = new TranscriptionStream()
+      transcriptionStream.onSegment = (segment) => {
+        if (onSegment) onSegment(segment)
+      }
+      transcriptionStream.onStatus = (status) => {
+        setStreamStatus(status)
+        if (onStatusChange) onStatusChange(status)
+      }
+      transcriptionStream.onError = (error) => {
+        console.error('Transcription error:', error)
+        if (onError) onError(error)
+      }
+
+      await transcriptionStream.connect()
+      transcriptionStreamRef.current = transcriptionStream
+
+      // Set up MediaRecorder
       const mediaRecorder = new MediaRecorder(stream, {
         mimeType: 'audio/webm;codecs=opus',
       })
 
       mediaRecorderRef.current = mediaRecorder
-      chunksRef.current = []
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data)
+      // Send audio chunks to server as they're available
+      mediaRecorder.ondataavailable = async (event) => {
+        if (event.data.size > 0 && transcriptionStreamRef.current) {
+          await transcriptionStreamRef.current.sendAudioChunk(event.data)
         }
       }
 
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-        setAudioBlob(blob)
-      }
-
-      mediaRecorder.start(1000) // Collect data every second
+      // Start recording with 500ms chunks for low latency
+      mediaRecorder.start(500)
       setIsRecording(true)
       setIsPaused(false)
       setRecordingTime(0)
@@ -57,9 +70,10 @@ function AudioRecorder({
       timerRef.current = setInterval(() => {
         setRecordingTime((prev) => prev + 1)
       }, 1000)
+
     } catch (err) {
-      console.error('Error accessing microphone:', err)
-      onTranscriptionError(new Error('Could not access microphone. Please grant permission.'))
+      console.error('Error starting recording:', err)
+      if (onError) onError(new Error('Could not access microphone. Please grant permission.'))
     }
   }
 
@@ -68,6 +82,11 @@ function AudioRecorder({
       mediaRecorderRef.current.pause()
       setIsPaused(true)
       clearInterval(timerRef.current)
+
+      // Tell server we're pausing
+      if (transcriptionStreamRef.current) {
+        transcriptionStreamRef.current.pause()
+      }
     }
   }
 
@@ -75,43 +94,49 @@ function AudioRecorder({
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'paused') {
       mediaRecorderRef.current.resume()
       setIsPaused(false)
+
+      // Resume timer
       timerRef.current = setInterval(() => {
         setRecordingTime((prev) => prev + 1)
       }, 1000)
+
+      // Tell server we're resuming
+      if (transcriptionStreamRef.current) {
+        transcriptionStreamRef.current.resume()
+      }
     }
   }
 
   const stopRecording = () => {
+    // Stop MediaRecorder
     if (mediaRecorderRef.current) {
       mediaRecorderRef.current.stop()
       setIsRecording(false)
       setIsPaused(false)
       clearInterval(timerRef.current)
 
-      // Stop all tracks
+      // Stop all audio tracks
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop())
       }
     }
-  }
 
-  const handleTranscribe = async () => {
-    if (!audioBlob) return
-
-    onTranscriptionStart()
-
-    try {
-      const result = await transcribeAudio(audioBlob, settings)
-      onTranscriptionComplete(result)
-    } catch (err) {
-      console.error('Transcription failed:', err)
-      onTranscriptionError(err.response?.data?.detail || err.message)
+    // Tell server we're done and close connection
+    if (transcriptionStreamRef.current) {
+      transcriptionStreamRef.current.stop()
+      // Give server time to flush, then close
+      setTimeout(() => {
+        if (transcriptionStreamRef.current) {
+          transcriptionStreamRef.current.close()
+          transcriptionStreamRef.current = null
+        }
+      }, 2000)
     }
   }
 
   const handleClear = () => {
-    setAudioBlob(null)
     setRecordingTime(0)
+    setStreamStatus(null)
   }
 
   // Cleanup on unmount
@@ -121,35 +146,59 @@ function AudioRecorder({
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop())
       }
+      if (transcriptionStreamRef.current) {
+        transcriptionStreamRef.current.close()
+      }
     }
   }, [])
+
+  const getStatusDisplay = () => {
+    if (!isRecording && !streamStatus) return null
+
+    if (isPaused) {
+      return (
+        <div className="status status-paused">
+          <span className="pulse-paused"></span>
+          Paused
+        </div>
+      )
+    }
+
+    if (streamStatus === 'transcribing') {
+      return (
+        <div className="status status-processing">
+          <span className="spinner"></span>
+          Transcribing...
+        </div>
+      )
+    }
+
+    if (streamStatus === 'listening' || isRecording) {
+      return (
+        <div className="status status-recording">
+          <span className="pulse"></span>
+          Listening...
+        </div>
+      )
+    }
+
+    return null
+  }
 
   return (
     <div className="audio-recorder">
       <AudioVisualizer
         stream={isRecording && !isPaused ? streamRef.current : null}
-        audioBlob={audioBlob}
+        audioBlob={null}
       />
 
       <div className="recording-time">{formatTime(recordingTime)}</div>
 
-      {isRecording && (
-        <div className="status status-recording">
-          <span className="pulse"></span>
-          {isPaused ? 'Paused' : 'Recording'}
-        </div>
-      )}
-
-      {isProcessing && (
-        <div className="status status-processing">
-          <span className="spinner"></span>
-          Processing...
-        </div>
-      )}
+      {getStatusDisplay()}
 
       <div className="recording-controls">
-        {!isRecording && !audioBlob && (
-          <button className="btn btn-primary" onClick={startRecording} disabled={isProcessing}>
+        {!isRecording && (
+          <button className="btn btn-primary" onClick={startRecording}>
             Start Recording
           </button>
         )}
@@ -172,25 +221,6 @@ function AudioRecorder({
             </button>
             <button className="btn btn-danger" onClick={stopRecording}>
               Stop
-            </button>
-          </>
-        )}
-
-        {audioBlob && !isRecording && (
-          <>
-            <button
-              className="btn btn-primary"
-              onClick={handleTranscribe}
-              disabled={isProcessing}
-            >
-              {isProcessing ? 'Transcribing...' : 'Transcribe'}
-            </button>
-            <button
-              className="btn btn-secondary"
-              onClick={handleClear}
-              disabled={isProcessing}
-            >
-              Clear
             </button>
           </>
         )}

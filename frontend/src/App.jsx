@@ -1,23 +1,22 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import AudioRecorder from './components/AudioRecorder'
 import TranscriptViewer from './components/TranscriptViewer'
 import Settings from './components/Settings'
 import { checkHealth } from './services/api'
 
 function App() {
-  const [transcript, setTranscript] = useState(null)
-  const [isProcessing, setIsProcessing] = useState(false)
+  const [segments, setSegments] = useState([])
+  const [streamStatus, setStreamStatus] = useState(null)
   const [error, setError] = useState(null)
   const [settings, setSettings] = useState({
     transcriptionMethod: 'local',
     enableDiarization: true,
-    language: null, // auto-detect
+    language: null,
   })
   const [health, setHealth] = useState(null)
   const [googleToken, setGoogleToken] = useState(null)
 
   useEffect(() => {
-    // Check backend health on mount
     checkHealth()
       .then(setHealth)
       .catch((err) => {
@@ -26,31 +25,51 @@ function App() {
       })
   }, [])
 
-  const handleTranscriptionComplete = (result) => {
-    setTranscript(result)
-    setIsProcessing(false)
+  // Handle new segment from streaming transcription
+  const handleSegment = useCallback((segment) => {
+    setSegments((prev) => [...prev, {
+      speaker: segment.speaker || 'Speaker',
+      start_time: segment.start,
+      end_time: segment.end,
+      text: segment.text,
+    }])
     setError(null)
-  }
+  }, [])
 
-  const handleTranscriptionError = (err) => {
+  // Handle status changes from streaming
+  const handleStatusChange = useCallback((status) => {
+    setStreamStatus(status)
+  }, [])
+
+  // Handle errors
+  const handleError = useCallback((err) => {
     setError(err.message || 'Transcription failed')
-    setIsProcessing(false)
-  }
+  }, [])
 
-  const handleTranscriptionStart = () => {
-    setIsProcessing(true)
-    setError(null)
-  }
-
+  // Handle Google login
   const handleGoogleLogin = (token) => {
     setGoogleToken(token)
   }
+
+  // Clear transcript
+  const handleClear = () => {
+    setSegments([])
+    setStreamStatus(null)
+    setError(null)
+  }
+
+  // Build transcript object for display
+  const transcript = segments.length > 0 ? {
+    segments,
+    duration: segments.length > 0 ? segments[segments.length - 1].end_time : 0,
+    text: segments.map(s => s.text).join(' '),
+  } : null
 
   return (
     <div className="app">
       <header className="header">
         <h1>Dictation App</h1>
-        <p>Record, transcribe, and save your meetings</p>
+        <p>Real-time speech transcription</p>
       </header>
 
       {error && (
@@ -59,9 +78,9 @@ function App() {
         </div>
       )}
 
-      {health && !health.whisper_available && settings.transcriptionMethod === 'local' && (
+      {health && !health.whisper_available && (
         <div className="message message-info">
-          Local Whisper not available. Switch to cloud transcription in settings or install openai-whisper.
+          Local Whisper not available. Install faster-whisper to enable transcription.
         </div>
       )}
 
@@ -70,11 +89,9 @@ function App() {
           <div className="card">
             <h2>Recording</h2>
             <AudioRecorder
-              settings={settings}
-              onTranscriptionStart={handleTranscriptionStart}
-              onTranscriptionComplete={handleTranscriptionComplete}
-              onTranscriptionError={handleTranscriptionError}
-              isProcessing={isProcessing}
+              onSegment={handleSegment}
+              onStatusChange={handleStatusChange}
+              onError={handleError}
             />
           </div>
 
@@ -92,10 +109,18 @@ function App() {
 
         <div className="right-column">
           <div className="card">
-            <h2>Transcript</h2>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h2 style={{ margin: 0 }}>Transcript</h2>
+              {segments.length > 0 && (
+                <button className="btn btn-secondary" onClick={handleClear} style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>
+                  Clear
+                </button>
+              )}
+            </div>
             <TranscriptViewer
               transcript={transcript}
-              isProcessing={isProcessing}
+              isProcessing={streamStatus === 'transcribing'}
+              isListening={streamStatus === 'listening'}
               googleToken={googleToken}
             />
           </div>

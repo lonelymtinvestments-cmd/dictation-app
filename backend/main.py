@@ -4,7 +4,10 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query
+import base64
+import json
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from google.oauth2.credentials import Credentials
@@ -35,6 +38,7 @@ from services.google_docs import (
     list_folders,
     is_google_docs_available,
 )
+from services.streaming_transcription import StreamingTranscriber
 
 # Configure logging
 logging.basicConfig(
@@ -210,6 +214,85 @@ async def get_google_folders(
     except Exception as e:
         logger.error(f"Failed to list folders: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/ws/transcribe")
+async def websocket_transcribe(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time streaming transcription.
+
+    Client sends:
+    - {"type": "audio", "data": "<base64 audio chunk>"}
+    - {"type": "pause"}
+    - {"type": "resume"}
+    - {"type": "stop"}
+
+    Server sends:
+    - {"type": "segment", "data": {...}}
+    - {"type": "status", "status": "listening" | "transcribing" | "paused"}
+    - {"type": "error", "message": "..."}
+    """
+    await websocket.accept()
+    logger.info("WebSocket connection established")
+
+    # Create transcriber instance for this connection
+    transcriber = StreamingTranscriber()
+
+    # Send initial status
+    await websocket.send_json({"type": "status", "status": "listening"})
+
+    try:
+        while True:
+            # Receive message from client
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            msg_type = message.get("type")
+
+            if msg_type == "audio":
+                # Decode audio chunk
+                audio_data = base64.b64decode(message.get("data", ""))
+
+                # Add to buffer and get any transcribed segments
+                await websocket.send_json({"type": "status", "status": "transcribing"})
+                segments = transcriber.add_chunk(audio_data)
+
+                # Send any new segments
+                for segment in segments:
+                    await websocket.send_json({
+                        "type": "segment",
+                        "data": segment
+                    })
+
+                await websocket.send_json({"type": "status", "status": "listening"})
+
+            elif msg_type == "pause":
+                transcriber.pause()
+                await websocket.send_json({"type": "status", "status": "paused"})
+
+            elif msg_type == "resume":
+                transcriber.resume()
+                await websocket.send_json({"type": "status", "status": "listening"})
+
+            elif msg_type == "stop":
+                # Flush remaining audio
+                await websocket.send_json({"type": "status", "status": "transcribing"})
+                segments = transcriber.flush()
+                for segment in segments:
+                    await websocket.send_json({
+                        "type": "segment",
+                        "data": segment
+                    })
+                await websocket.send_json({"type": "status", "status": "complete"})
+                break
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
 
 
 if __name__ == "__main__":

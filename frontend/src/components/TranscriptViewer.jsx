@@ -1,10 +1,18 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { saveToGoogleDocs } from '../services/api'
 
-function TranscriptViewer({ transcript, isProcessing, googleToken }) {
+function TranscriptViewer({ transcript, isProcessing, isListening, googleToken }) {
   const [isSaving, setIsSaving] = useState(false)
   const [saveSuccess, setSaveSuccess] = useState(null)
   const [saveError, setSaveError] = useState(null)
+  const transcriptRef = useRef(null)
+
+  // Auto-scroll to bottom when new segments arrive
+  useEffect(() => {
+    if (transcriptRef.current && transcript?.segments?.length > 0) {
+      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight
+    }
+  }, [transcript?.segments?.length])
 
   const formatTimestamp = (seconds) => {
     const hrs = Math.floor(seconds / 3600)
@@ -53,27 +61,45 @@ function TranscriptViewer({ transcript, isProcessing, googleToken }) {
     navigator.clipboard.writeText(text)
   }
 
-  if (isProcessing) {
+  // Show listening indicator
+  if (isListening && (!transcript || transcript.segments.length === 0)) {
     return (
       <div className="transcript">
         <div style={{ textAlign: 'center', padding: '2rem' }}>
-          <div className="spinner" style={{ margin: '0 auto 1rem' }}></div>
-          <p>Processing audio...</p>
+          <div className="listening-indicator">
+            <span className="listening-dot"></span>
+            <span className="listening-dot"></span>
+            <span className="listening-dot"></span>
+          </div>
+          <p style={{ marginTop: '1rem' }}>Listening...</p>
           <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>
-            This may take a moment depending on the audio length
+            Start speaking and your words will appear here
           </p>
         </div>
       </div>
     )
   }
 
-  if (!transcript) {
+  // Show processing indicator
+  if (isProcessing && (!transcript || transcript.segments.length === 0)) {
+    return (
+      <div className="transcript">
+        <div style={{ textAlign: 'center', padding: '2rem' }}>
+          <div className="spinner" style={{ margin: '0 auto 1rem' }}></div>
+          <p>Processing audio...</p>
+        </div>
+      </div>
+    )
+  }
+
+  // Show empty state
+  if (!transcript || transcript.segments.length === 0) {
     return (
       <div className="transcript">
         <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)' }}>
           <p>No transcript yet</p>
           <p style={{ fontSize: '0.875rem' }}>
-            Record some audio and click Transcribe to get started
+            Click Start Recording to begin
           </p>
         </div>
       </div>
@@ -115,9 +141,10 @@ function TranscriptViewer({ transcript, isProcessing, googleToken }) {
       <div style={{ fontSize: '0.875rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
         Duration: {formatTimestamp(transcript.duration)} |
         Segments: {transcript.segments.length}
+        {isListening && <span style={{ marginLeft: '0.5rem', color: 'var(--success)' }}>● Live</span>}
       </div>
 
-      <div className="transcript">
+      <div className="transcript" ref={transcriptRef}>
         {transcript.segments.map((segment, index) => (
           <div key={index} className="transcript-segment">
             <span className={`speaker-label ${getSpeakerClass(segment.speaker)}`}>
@@ -129,6 +156,15 @@ function TranscriptViewer({ transcript, isProcessing, googleToken }) {
             <p className="segment-text">{segment.text}</p>
           </div>
         ))}
+
+        {/* Show typing indicator when listening and has content */}
+        {isListening && (
+          <div className="transcript-segment typing-indicator">
+            <span className="listening-dot"></span>
+            <span className="listening-dot"></span>
+            <span className="listening-dot"></span>
+          </div>
+        )}
       </div>
     </div>
   )
